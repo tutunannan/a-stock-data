@@ -132,14 +132,18 @@ print("人气第一:", hot[0]["name"], "概念命中:", em_hot_concept(hot[0]["c
 沪市公司的问答只能走这里。`code=None` 看全市场；给沪市代码（60 / 68 / 900 开头）只看该公司。
 `kind='answered'` 为最新已回复问答，`kind='questions'` 为最新提问（含未回复，`answer` 为 None）。
 平台只开放近期问答，公司维度实测约近 1 个月。首次查某家公司要在公司列表里定位 uid（倍增 + 二分，约 10–13 次请求），之后走缓存。
+**时间写法不统一（2026-10-23 实测）：** 提问时间是绝对时间（`2026年10月21日 17:47`），1 天内的回复时间是相对时间（`昨天 18:22`），
+返回的 `question_time` / `answer_time` 都换算成 `YYYY-MM-DD HH:MM`（相对时间按北京时间 UTC+8），认不出直接报错。
 北交所公司两个平台都没有。
 
 <!-- v39-sse-e:start -->
 ```python
+import datetime as _dt
 import html as _html
 import re
 
 SSE_E_BASE = "https://sns.sseinfo.com"
+_SSE_CN_TZ = _dt.timezone(_dt.timedelta(hours=8))   # 「昨天 18:22」按北京时间换算，海外服务器也不跑偏
 _sse_uid_cache = {}                 # 证券代码 → 上证e互动公司 uid
 _sse_company_pages = {}             # 页码 → [(code, uid)]，二分查找时复用
 _SSE_COMPANY_END = "没有任何上市公司的信息"
@@ -195,9 +199,69 @@ def _sse_text(fragment):
     return _html.unescape(re.sub(r"<[^>]+>", "", fragment)).strip()
 
 
-def _sse_time(text):
-    match = re.search(r"(\d{4})年(\d{2})月(\d{2})日\s*(\d{2}:\d{2})", text)
-    return f"{match.group(1)}-{match.group(2)}-{match.group(3)} {match.group(4)}" if match else None
+# 站点时间两种写法并存（2026-10-23 实测）：提问是绝对时间「2026年10月21日 17:47」，
+# 1 天内的回复是相对时间「昨天 18:22」。只认绝对写法会让整页解析直接抛错。
+_SSE_ABS_TIME = re.compile(r"(\d{4})\s*[年\-/]\s*(\d{1,2})\s*[月\-/]\s*(\d{1,2})\s*日?\s*(\d{1,2}):(\d{2})")
+_SSE_DAY_WORD_TIME = re.compile(r"^(今天|昨天|前天)\s*(\d{1,2}):(\d{2})$")
+_SSE_MONTH_DAY_TIME = re.compile(r"^(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})$")
+_SSE_AGO_TIME = re.compile(r"^(\d+)\s*(秒|分钟|小时|天)前$")
+_SSE_CLOCK_TIME = re.compile(r"^(\d{1,2}):(\d{2})$")
+_SSE_DAY_WORD = {"今天": 0, "昨天": 1, "前天": 2}
+_SSE_AGO_UNIT = {"秒": "seconds", "分钟": "minutes", "小时": "hours", "天": "days"}
+
+
+def _sse_time(text, now=None):
+    """把站点的时间文案换算成「YYYY-MM-DD HH:MM」；认不出返回 None，由调用方决定是否报错。
+
+    相对写法按北京时间算；now 可注入，便于离线测试固定日期。
+    """
+    text = (text or "").strip()
+    now = (now or _dt.datetime.now(_SSE_CN_TZ)).replace(tzinfo=None)
+    match = _SSE_ABS_TIME.search(text)
+    if match:
+        year, month, day, hour, minute = (int(group) for group in match.groups())
+        try:
+            return _dt.datetime(year, month, day, hour, minute).strftime("%Y-%m-%d %H:%M")
+        except ValueError:      # 2 月 30 日这类不存在的日期算认不出，不抛 ValueError 给上层
+            return None
+    match = _SSE_DAY_WORD_TIME.match(text)
+    if match:
+        when = now - _dt.timedelta(days=_SSE_DAY_WORD[match.group(1)])
+        try:
+            return when.replace(hour=int(match.group(2)), minute=int(match.group(3)),
+                                second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+        except ValueError:      # 非法时分算认不出
+            return None
+    match = _SSE_MONTH_DAY_TIME.match(text)
+    if match:
+        month, day, hour, minute = (int(group) for group in match.groups())
+        try:
+            when = _dt.datetime(now.year, month, day, hour, minute)
+        except ValueError:
+            return None
+        if when - now > _dt.timedelta(days=1):   # 跨年：1 月里看到「12-31」是去年的
+            try:
+                when = when.replace(year=now.year - 1)
+            except ValueError:  # 去年可能没有 2 月 29 日
+                return None
+        return when.strftime("%Y-%m-%d %H:%M")
+    match = _SSE_AGO_TIME.match(text)
+    if match:
+        try:
+            delta = _dt.timedelta(**{_SSE_AGO_UNIT[match.group(2)]: int(match.group(1))})
+            return (now - delta).strftime("%Y-%m-%d %H:%M")
+        except (OverflowError, ValueError):  # N 过大算认不出
+            return None
+    if text in ("刚刚", "刚才"):
+        return now.strftime("%Y-%m-%d %H:%M")
+    match = _SSE_CLOCK_TIME.match(text)    # 只有时分 = 今天
+    if match:
+        try:
+            return now.replace(hour=int(match.group(1)), minute=int(match.group(2)),
+                               second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+        except ValueError:      # 非法时分算认不出
+            return None
+    return None
 
 
 def _sse_required_time(item_id, text):
